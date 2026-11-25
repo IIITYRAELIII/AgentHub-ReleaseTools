@@ -44,6 +44,7 @@
     "tests/hub-client.test.mjs",
     "tests/test_build_release.py",
     "tests/build.test.mjs",
-    "tests/external-release-continuation.test.mjs"
+    "tests/external-release-continuation.test.mjs",
+    "tests/test_continue_release.py"
   ]
 }

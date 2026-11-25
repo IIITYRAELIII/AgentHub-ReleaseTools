@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -159,7 +159,7 @@ function active(pid) {
 
 test("external release worker resumes from owner receipts and rejects tool drift", {
   skip: process.platform !== "win32" ? "Windows installer and native worker" :
-    !APP ? "set AGENT_HUB_RELEASE_TEST_APP to a published AgentHub checkout with its dependencies" : false,
+    !APP ? "set AGENT_HUB_RELEASE_TEST_APP to a Hub checkout with the local continuation action and its dependencies" : false,
 }, async (t) => {
   const fromApp = name => import(pathToFileURL(path.join(APP, name)).href);
   const { callDesktopControl } = await fromApp("desktop-control.mjs");
@@ -171,25 +171,32 @@ test("external release worker resumes from owner receipts and rejects tool drift
   const { isRuntimeSourceFile } = await fromApp("src/infrastructure/filesystem/runtime-manifest-verifier.mjs");
   const publisher = await prepareWindowsLockDirectoryPublisher();
   t.after(() => publisher.shutdown());
-  for (const outcome of ["succeeded", "rolled-back", "scratch-refused", "prepare-refused", "provider-refused",
+  for (const outcome of ["succeeded", "retry-succeeded", "retry-queued-succeeded", "rolled-back",
+    "scratch-refused", "prepare-refused", "provider-refused",
     "legacy-provider-conflict-unsaved", "legacy-provider-conflict-retained",
     "failed", "tool-drift", "build-drift"]) {
     await t.test(outcome, async (sub) => {
       const base = await mkdtemp(path.join(os.tmpdir(), "hub-release-continuation-"));
       const runtimeRoot = path.join(base, "runtime");
       const dataDir = path.join(runtimeRoot, "data");
+      const turnRelease = path.join(runtimeRoot, "fixtures", "turn-release");
       const projectRoot = path.join(base, "project");
-      const providerState = path.join(base, "provider.json");
+      const providerState = path.join(runtimeRoot, "fixtures", "provider.json");
       const config = path.join(runtimeRoot, "config.json");
+      const connection = path.join(base, "connection.json");
       const candidate = path.join(base, "candidate");
       const tools = path.join(base, "tools");
       const directory = path.join(base, "operation");
+      const retryQueued = outcome === "retry-queued-succeeded";
+      const retry = outcome === "retry-succeeded" || retryQueued;
+      const succeeds = outcome === "succeeded" || retry;
       const legacyConflict = outcome.startsWith("legacy-provider-conflict-");
       const readback = path.join(base, "observed-readback.json");
       const oldRelease = "old-release";
       const candidateRelease = "candidate-release";
       const version = (await read(path.join(APP, "package.json"))).version;
       const threadId = "10000000-0000-4000-8000-000000000001";
+      const rollout = path.join(base, "fixture-rollout.jsonl");
       const owner = new E2eChildProcessOwner({ label: "external-release fixture Hub" });
       const telegram = new FakeTelegramApi();
       await telegram.start();
@@ -205,13 +212,14 @@ test("external release worker resumes from owner receipts and rejects tool drift
       });
       await Promise.all([
         mkdir(dataDir, { recursive: true }),
+        mkdir(path.dirname(turnRelease), { recursive: true }),
         mkdir(projectRoot),
         ...[oldRelease, candidateRelease].map(name => mkdir(path.join(runtimeRoot, "releases", name), { recursive: true })),
       ]);
       const runtimeFiles = (await readdir(APP, { withFileTypes: true }))
         .filter(entry => (entry.isFile() && /\.(mjs|cjs)$/u.test(entry.name))
           || ["src", "AGENT_HUB_GUIDE.md", "package.json"].includes(entry.name)
-          || (outcome === "succeeded" && entry.name === "assets"));
+          || (succeeds && entry.name === "assets"));
       for (const name of [oldRelease, candidateRelease]) {
         const installed = path.join(runtimeRoot, "releases", name);
         await Promise.all(runtimeFiles.map(entry => cp(path.join(APP, entry.name), path.join(installed, entry.name), {
@@ -246,7 +254,7 @@ test("external release worker resumes from owner receipts and rejects tool drift
         "AgentHub.RuntimeHost.exe",
         "agent-hub-main.mjs",
       ];
-      if (outcome === "succeeded") {
+      if (succeeds) {
         const entries = await readdir(staged, { recursive: true, withFileTypes: true });
         runtimePaths = [...new Set([...runtimePaths, ...entries.filter(entry => entry.isFile()).map(entry =>
           path.relative(staged, path.join(entry.parentPath, entry.name)).split(path.sep).join("/"))
@@ -263,12 +271,18 @@ test("external release worker resumes from owner receipts and rejects tool drift
         allowedUserIds: [USER_ID], allowedChatIds: [CHAT_ID], privateChatsOnly: true,
         provider: "codex", projectRoot, projects: [{ name: "Release continuation fixture", path: projectRoot }],
         dataDir, codexExecutable: process.execPath,
-        codexExecutableArgs: [path.join(APP, "e2e", "fake-codex-app-server.mjs"), "--state", providerState],
+        codexExecutableArgs: [path.join(APP, "e2e", "fake-codex-app-server.mjs"), "--state", providerState,
+          "--require-test-contour", "--whole-release-file", turnRelease],
         codexRolloutContext: { enabled: false },
       });
+      const seedIdleRollout = () => writeFile(rollout, JSON.stringify({
+        timestamp: new Date().toISOString(), type: "session_meta", payload: { id: threadId, cwd: projectRoot },
+      }) + "\n", "utf8");
+      if (!retryQueued) await seedIdleRollout();
       await put(providerState, {
         nextThread: 2, nextTurn: 1, nextMessage: 1, requestCounts: {},
         threads: [{ id: threadId, cwd: projectRoot, name: "Release recipient", preview: "",
+          path: rollout, managedRolloutPath: rollout, managedRolloutOrdinal: 1,
           updatedAt: Math.floor(Date.now() / 1000), turns: [], model: "gpt-5.6-sol", archived: false }],
       });
       await put(path.join(dataDir, "state.json"), {
@@ -285,6 +299,13 @@ test("external release worker resumes from owner receipts and rejects tool drift
       } finally {
         await catalog.close();
       }
+      // Use a private fixture key and the real bound Stream. The running
+      // service validates the signed token exactly as for its MCP transport.
+      const secret = randomBytes(32).toString("base64url");
+      const actor = Buffer.from(JSON.stringify({ v: 1, provider: "codex", threadId, streamId: stream })).toString("base64url");
+      const contextToken = actor + "." + createHmac("sha256", secret).update(actor).digest("base64url");
+      await writeFile(path.join(runtimeRoot, "hub-mcp.secret"), secret + "\n");
+      await put(connection, { url: "http://127.0.0.1:1/not-used", contextToken });
       const start = (releaseId) => {
         hub = owner.start(() => spawn(process.execPath, [
           path.join(runtimeRoot, "releases", releaseId, "agent-hub-main.mjs"),
@@ -292,6 +313,8 @@ test("external release worker resumes from owner receipts and rejects tool drift
           cwd: APP,
           env: { ...process.env, AGENT_HUB_CONFIG: config, AGENT_HUB_RUNTIME_ROOT: runtimeRoot,
             AGENT_HUB_RELEASE_ID: releaseId, AGENT_HUB_TEST_CONTOUR: "1",
+            AGENT_HUB_TEST_CONTOUR_PROFILE: "fake-codex",
+            CODEX_HOME: path.join(base, "codex"),
             AGENT_HUB_LAUNCHER: "", AGENT_HUB_DISABLE_SECRET_ACL: "1" },
           stdio: ["ignore", "ignore", "pipe"],
           windowsHide: true,
@@ -309,18 +332,87 @@ test("external release worker resumes from owner receipts and rejects tool drift
       };
       start(oldRelease);
       const initial = await waitReady();
-      const commit = await stageCandidate(candidate, tools, outcome, manifested, staged, directory);
-      const tool = JSON.parse((await exec(process.execPath, [path.join(tools, "bin/release.mjs"), "identity"])).stdout);
-      const { stdout } = await exec(PYTHON, ["-X", "utf8", "-B", SCRIPT, "start", "--directory", directory,
-        "--candidate", candidate, "--commit", commit, "--tools-root", tools, "--tools-sha256", tool.sha256,
-        "--runtime-root", runtimeRoot, "--release-id", candidateRelease, "--artifact-version", version + "+build.1",
-        "--stream", stream, "--selection", JSON.stringify({ mode: "include", ids: ["fixture:chosen"] })], {
-        timeout: 15_000, windowsHide: true,
-      });
-      const dispatch = JSON.parse(stdout);
-      workerPid = dispatch.worker.pid;
+      const launch = async (candidate, tools, directory, outcome, retryOf = []) => {
+        const commit = await stageCandidate(candidate, tools, outcome, manifested, staged, directory);
+        const tool = JSON.parse((await exec(process.execPath, [path.join(tools, "bin/release.mjs"), "identity"])).stdout);
+        const { stdout } = await exec(PYTHON, ["-X", "utf8", "-B", SCRIPT, "start", "--directory", directory,
+          "--candidate", candidate, "--commit", commit, "--tools-root", tools, "--tools-sha256", tool.sha256,
+          "--runtime-root", runtimeRoot, "--release-id", candidateRelease, "--artifact-version", version + "+build.1",
+          "--stream", stream, "--connection-file", connection,
+          "--selection", JSON.stringify({ mode: "include", ids: ["fixture:chosen"] }),
+          ...retryOf], { timeout: 30_000, windowsHide: true });
+        const receipt = JSON.parse(stdout);
+        workerPid = receipt.worker.pid;
+        return receipt;
+      };
+      const resume = directory => exec(PYTHON, ["-X", "utf8", "-B", SCRIPT, "resume-delivery", directory],
+        { timeout: 20_000, windowsHide: true });
+      const messageReceipt = async id => {
+        const snapshot = await callDesktopControl("snapshot", { messageReceiptIds: [id] }, { runtimeRoot });
+        return snapshot.messageReceipts.find(item => item.clientUserMessageId === id);
+      };
+      const readHistory = () => callDesktopControl("task-history", { streamId: stream, limit: 10 }, { runtimeRoot });
+      const closeFixtureTurn = async () => {
+        await writeFile(turnRelease, "complete", "utf8");
+        await waitFor(async () => {
+          const snapshot = await callDesktopControl("snapshot", {}, { runtimeRoot });
+          return snapshot.activeCount === 0;
+        }, "fixture turn retires before replacing Hub", 15_000);
+      };
+      let heldTurn;
+      if ((retry && !retryQueued) || outcome === "failed") {
+        const holdId = "release-retry-fixture-hold";
+        const hold = await callDesktopControl("send-message", {
+          streamId: stream, text: "[whole-update-wait]", clientUserMessageId: holdId,
+        }, { runtimeRoot });
+        assert.equal(hold.accepted, true);
+        heldTurn = await waitFor(async () => {
+          const receipt = await messageReceipt(holdId);
+          return receipt?.providerAccepted ? receipt.turnId : null;
+        }, "fixture hold reaches provider", 15_000);
+      }
+      let failed;
+      if (retry) {
+        const failedDirectory = path.join(base, "failed-attempt");
+        const first = await launch(path.join(base, "failed-candidate"), path.join(base, "failed-tools"), failedDirectory, "failed");
+        const firstQueue = path.join(failedDirectory, "QUEUE-RECEIPT.json");
+        const firstReceipt = await waitFor(() => read(firstQueue).catch(() => null), "failed-attempt queue receipt", 25_000);
+        assert.equal(firstReceipt.clientUserMessageId, `mcp:${first.operationId}:continue`);
+        if (retryQueued) {
+          assert.equal(firstReceipt.queued, true);
+          assert.equal(firstReceipt.providerAccepted, false);
+        } else {
+          const steered = await waitFor(async () => {
+            const receipt = await messageReceipt(firstReceipt.clientUserMessageId);
+            return receipt?.providerAccepted ? receipt : null;
+          }, "checks failure steered to provider", 15_000);
+          assert.equal(steered.turnId, heldTurn);
+          assert.equal(steered.steered, true);
+          assert.equal(steered.origin.kind, "interstream");
+          assert.equal(steered.origin.streamId, stream);
+        }
+        await waitFor(() => !active(workerPid), "failed-attempt worker joined", 10_000);
+        failed = { directory: failedDirectory, ...first, receipt: firstReceipt, reportBytes: await readFile(first.report) };
+        assert.equal(JSON.parse(failed.reportBytes).stage, "checks");
+        await rm(firstQueue);
+      }
+      const dispatch = await launch(candidate, tools, directory, succeeds ? "succeeded" : outcome,
+        retry ? ["--retry-of", failed.directory] : []);
+      if (retry) {
+        const originalId = failed.receipt.clientUserMessageId;
+        const old = await read(path.join(directory, "PREDECESSOR.json"));
+        assert.equal(old.operationId, failed.operationId);
+        assert.equal(old.notification.clientUserMessageId, originalId);
+        const previous = await messageReceipt(originalId);
+        assert.equal(previous.providerAccepted, !retryQueued);
+        assert.equal(previous.steered, !retryQueued);
+        assert.equal(old.notification.cancelled, retryQueued);
+        assert.deepEqual(await readFile(failed.report), failed.reportBytes);
+        if (retryQueued) await seedIdleRollout();
+        else await closeFixtureTurn();
+      }
       const scratch = path.join(directory, "installer-scratch");
-      const installation = outcome === "succeeded" || outcome === "rolled-back" || legacyConflict;
+      const installation = succeeds || outcome === "rolled-back" || legacyConflict;
       if (installation) {
         let install;
         if (legacyConflict) {
@@ -343,8 +435,8 @@ test("external release worker resumes from owner receipts and rejects tool drift
         assert.equal(install.operation_id, dispatch.operationId);
         assert.equal(install.mode, "wait");
         await owner.stop();
-        const activeRelease = outcome === "succeeded" ? candidateRelease : oldRelease;
-        if (outcome === "succeeded") {
+        const activeRelease = succeeds ? candidateRelease : oldRelease;
+        if (succeeds) {
           const verified = path.join(base, "verified");
           await exec(PYTHON, ["-X", "utf8", "-B", "-c", `
 import importlib.util, pathlib, sys
@@ -360,15 +452,15 @@ module.extract_verified(pathlib.Path(archive), digest, pathlib.Path(target))
         }
         const store = new MaintenanceOperationStore({ dataDir });
         store.create({
-          operationId: dispatch.operationId, outcome: legacyConflict ? "rolled-back" : outcome,
+          operationId: dispatch.operationId, outcome: succeeds ? "succeeded" : "rolled-back",
           kind: "restart", streamId: "agent-hub-installer",
           threadId: runtimeRoot,
-          status: outcome === "succeeded" ? "succeeded" : "failed",
-          phase: outcome === "succeeded" ? "ready" : "previous-ready",
+          status: succeeds ? "succeeded" : "failed",
+          phase: succeeds ? "ready" : "previous-ready",
           metadata: {
             autonomousInstaller: { releaseId: candidateRelease, archiveSha256: install.sha256,
               previous: { releaseId: oldRelease } },
-            [outcome === "succeeded" ? "autonomousReady" : "autonomousRecovery"]: { releaseId: activeRelease },
+            [succeeds ? "autonomousReady" : "autonomousRecovery"]: { releaseId: activeRelease },
           },
         });
         for (const file of ["result.json", "failure.json"]) {
@@ -380,7 +472,8 @@ module.extract_verified(pathlib.Path(archive), digest, pathlib.Path(target))
         assert.notEqual((await waitReady()).pid, initial.pid);
       }
       const report = await waitFor(() => read(dispatch.report).catch(() => null), "terminal report", 25_000);
-      assert.equal(report.status, legacyConflict ? "rolled-back" : installation ? outcome : "failed", JSON.stringify(report));
+      const expectedStatus = succeeds ? "succeeded" : installation ? "rolled-back" : "failed";
+      assert.equal(report.status, expectedStatus, JSON.stringify(report));
       if (installation) {
         assert.equal(report.installer.operationId, dispatch.operationId);
         assert.equal(report.installer.entityType, "maintenance-operation");
@@ -428,8 +521,30 @@ module.extract_verified(pathlib.Path(archive), digest, pathlib.Path(target))
           throw new Error(error.message + ": " + JSON.stringify(await read(path.join(directory, "QUEUE-ERROR.json")).catch(() => null)));
         });
       assert.equal(receipt.streamId, stream);
-      assert.equal(receipt.clientUserMessageId, dispatch.operationId + ":continue");
-      assert.equal(receipt.queued, true);
+      assert.equal(receipt.clientUserMessageId, `mcp:${dispatch.operationId}:continue`);
+      const current = await waitFor(async () => {
+        const actual = await messageReceipt(receipt.clientUserMessageId);
+        return actual?.providerAccepted ? actual : null;
+      }, "notice provider acceptance", 20_000);
+      assert.equal(current.origin.kind, "interstream");
+      assert.equal(current.origin.streamId, stream);
+      assert.match(current.author, /Release fixture - Release recipient/u);
+      if (outcome === "failed") {
+        assert.equal(current.turnId, heldTurn);
+        assert.equal(current.steered, true);
+        await assert.rejects(callDesktopControl("release-continuation", {
+          streamId: stream, requestId: "foreign-capability", text: "fixture", contextToken: "tampered.invalid",
+        }, { runtimeRoot }), /invalid Agent Hub context capability/u);
+        assert.equal(await messageReceipt("mcp:foreign-capability"), undefined);
+        await closeFixtureTurn();
+        await waitFor(async () => {
+          const history = await readHistory();
+          return history.items.some(item => item.completed && item.messages.some(message =>
+            message.clientUserMessageId === receipt.clientUserMessageId && message.origin?.kind === "interstream"));
+        }, "original active turn materialized before replacing Hub", 15_000);
+      } else {
+        assert.equal(current.steered, false);
+      }
       await waitFor(() => !active(workerPid), "worker exit", 10_000);
       if (outcome.endsWith("-drift")) return;
       // Emulate a lost local readback after canonical admission and retry that
@@ -437,16 +552,40 @@ module.extract_verified(pathlib.Path(archive), digest, pathlib.Path(target))
       await rm(queuePath);
       const previous = await waitReady();
       await owner.stop();
-      start(outcome === "succeeded" ? candidateRelease : oldRelease);
+      start(succeeds ? candidateRelease : oldRelease);
       assert.notEqual((await waitReady()).pid, previous.pid);
-      await exec(PYTHON, ["-X", "utf8", "-B", SCRIPT, "resume-delivery", directory], { timeout: 20_000, windowsHide: true });
+      await resume(directory);
       const replay = await read(queuePath);
-      assert.equal(replay.id, receipt.id);
+      assert.equal(replay.clientUserMessageId, receipt.clientUserMessageId);
+      assert.equal(replay.runId, current.runId);
+      if (retry) {
+        await resume(failed.directory);
+        await assert.rejects(read(path.join(failed.directory, "QUEUE-RECEIPT.json")), { code: "ENOENT" });
+        assert.deepEqual(await readFile(failed.report), failed.reportBytes);
+      }
+      if (retry || outcome === "failed") {
+        const ids = [receipt.clientUserMessageId, ...(retry && !retryQueued ? [failed.receipt.clientUserMessageId] : [])];
+        const messages = await waitFor(async () => {
+          const history = await readHistory();
+          const all = history.items.flatMap(item => item.messages);
+          if (retryQueued) assert.equal(all.some(item => item.clientUserMessageId === failed.receipt.clientUserMessageId), false);
+          const retained = all.filter(item => ids.includes(item.clientUserMessageId));
+          return retained.length >= ids.length ? retained : null;
+        }, "service notices in reopened history", 15_000);
+        assert.deepEqual(messages.map(item => item.clientUserMessageId).sort(), ids.sort());
+        for (const message of messages) {
+          assert.equal(message.origin.kind, "interstream");
+          assert.equal(message.origin.streamId, stream);
+          assert.match(message.author, /Release fixture - Release recipient/u);
+          assert.match(message.text, /^Продолжай выпуск\./u);
+        }
+      }
       const db = new DatabaseSync(messageCommandLedgerPath(dataDir), { readOnly: true });
       try {
-        const query = db.prepare(`SELECT client_user_message_id id FROM message_commands WHERE client_user_message_id LIKE 'install-%:continue'
-          UNION ALL SELECT client_user_message_id id FROM message_command_terminal_archive WHERE client_user_message_id LIKE 'install-%:continue'`);
-        assert.deepEqual(query.all().map(row => row.id), [receipt.clientUserMessageId]);
+        const query = db.prepare(`SELECT client_user_message_id id FROM message_commands WHERE client_user_message_id LIKE 'mcp:install-%:continue'
+          UNION ALL SELECT client_user_message_id id FROM message_command_terminal_archive WHERE client_user_message_id LIKE 'mcp:install-%:continue'`);
+        assert.deepEqual(query.all().map(row => row.id).sort(),
+          [receipt.clientUserMessageId, ...(retry ? [failed.receipt.clientUserMessageId] : [])].sort());
       } finally {
         db.close();
       }

@@ -1,6 +1,8 @@
 """Build and install one reviewed candidate, then queue its result in Hub."""
 
 import argparse
+from contextlib import contextmanager, nullcontext
+import errno
 import hashlib
 import importlib.util
 import json
@@ -9,6 +11,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import time
 import uuid
 import zipfile
@@ -111,24 +114,139 @@ def ready(job):
     return None
 
 
+def continuation_request(job):
+    return job["operation_id"] + ":continue"
+
+
+def continuation_id(job):
+    return "mcp:" + continuation_request(job)
+
+
+def continuation_token(job):
+    file = job.get("connection_file")
+    if not file:
+        raise RuntimeError("This attempt has no private Inter-Stream connection file")
+    token = read(Path(file)).get("contextToken")
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError("The private connection file has no caller capability")
+    return token
+
+
+@contextmanager
+def continuation_lock(directory):
+    import msvcrt
+
+    # Lock one byte on a stable file. Windows releases it if its owner exits.
+    with (directory / "CONTINUATION.lock").open("a+b") as lock:
+        lock.seek(0)
+        while True:
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EDEADLK):
+                    raise
+                time.sleep(0.1)
+        yield
+
+
+def selected_attempt(job):
+    return {"operationId": job["operation_id"], "directory": job["directory"]}
+
+
+def message_receipt(job):
+    command_id = continuation_id(job)
+    snapshot = desktop(job, "snapshot", {"compactSnapshot": True, "messageReceiptIds": [command_id]})
+    if snapshot is None:
+        return None
+    for receipt in snapshot["messageReceipts"]:
+        if receipt["clientUserMessageId"] == command_id:
+            if receipt.get("streamId") != job["stream"]:
+                raise RuntimeError("Hub receipt targets a different Stream")
+            return receipt
+    return None
+
+
+def provider_accepted(receipt):
+    return (receipt.get("providerAccepted") is True or receipt.get("steered") is True
+            or receipt.get("commandState") in ("started", "completed"))
+
+
+def retired_receipt(receipt):
+    return receipt and (provider_accepted(receipt) or receipt.get("cancelled") is True
+                        or receipt.get("commandState") == "failed")
+
+
+def retire_notification(previous, directory):
+    command_id = continuation_id(previous)
+    # Both admission and send hold the same lock. A missing local intent for a
+    # managed attempt positively identifies one that has never called Hub.
+    if not any((directory / name).exists() for name in ("QUEUE-INTENT.json", "QUEUE-RECEIPT.json")):
+        return {"clientUserMessageId": command_id, "notSubmitted": True}
+    receipt = message_receipt(previous)
+    if retired_receipt(receipt):
+        return receipt
+    if (receipt and receipt.get("id") and not receipt.get("dispatching") and not receipt.get("unknown")
+            and receipt.get("commandState") in ("accepted", "queued", "attention-required")):
+        params = {"action": "cancel", "id": receipt["id"], "clientUserMessageId": command_id}
+        try:
+            cancelled = desktop(previous, "deferred-input", params, command_id + ":cancel")
+        except RuntimeError:
+            # A concurrent reservation can win this race. Only the subsequent
+            # read of this original can resolve what happened.
+            cancelled = None
+        if (cancelled and cancelled.get("cancelled") is True and cancelled.get("id") == receipt["id"]
+                and cancelled.get("clientUserMessageId") == command_id):
+            return cancelled
+        receipt = message_receipt(previous)
+        if retired_receipt(receipt):
+            return receipt
+    raise RuntimeError(f"Cannot confirm the original Hub notification {command_id}; retry was not admitted")
+
+
 def deliver(job, directory, report):
     receipt_path = directory / "QUEUE-RECEIPT.json"
-    if receipt_path.exists():
-        return
-    command_id = job["operation_id"] + ":continue"
-    params = dict(streamId=job["stream"], text=report["message"], followUpMode="queue",
-                  clientProjectionIntent="queue", clientUserMessageId=command_id)
+    intent_path = directory / "QUEUE-INTENT.json"
+    if "continuation_directory" not in job:
+        if receipt_path.exists():
+            return
+        raise RuntimeError("This attempt predates Inter-Stream continuation; its original sender cannot be changed")
+    chain = Path(job["continuation_directory"])
+    command_id = continuation_id(job)
     delay = 2
     while True:
-        if ready(job):
-            receipt = desktop(job, "send-message", params, command_id)
-            if receipt is not None:
-                if (receipt.get("streamId") != job["stream"]
-                        or receipt.get("clientUserMessageId") != command_id
-                        or not (receipt.get("queued") or receipt.get("providerAccepted"))):
-                    raise RuntimeError("Hub did not confirm queue admission for the original message")
-                save(receipt_path, receipt)
+        with continuation_lock(chain):
+            if read(chain / "CONTINUATION.json") != selected_attempt(job):
                 return
+            if receipt_path.exists():
+                return
+            if ready(job):
+                submitted = intent_path.exists()
+                receipt = message_receipt(job) if submitted else None
+                if receipt is None:
+                    params = dict(streamId=job["stream"], text=report["message"],
+                                  requestId=continuation_request(job), contextToken=continuation_token(job))
+                    if not submitted:
+                        save(intent_path, {"clientUserMessageId": command_id})
+                    result = desktop(job, "release-continuation", params, command_id)
+                    if result is not None:
+                        if result.get("retry") is True:
+                            # The local route explicitly declined before MCP
+                            # admission. Keep any earlier uncertain attempt.
+                            if not submitted:
+                                intent_path.unlink()
+                        else:
+                            receipt = result["delivery"]
+                if receipt is not None:
+                    if receipt.get("streamId") != job["stream"] or receipt.get("clientUserMessageId") != command_id:
+                        raise RuntimeError("Hub did not confirm queue admission for the original message")
+                    if receipt.get("cancelled"):
+                        return
+                    if receipt.get("queued") or receipt.get("steerPending") or provider_accepted(receipt):
+                        save(receipt_path, receipt)
+                        return
+                    if receipt.get("failed") or receipt.get("rejected"):
+                        raise RuntimeError(f"Hub rejected the original notification {command_id}")
         time.sleep(delay)
         delay = min(delay * 2, 15)
 
@@ -439,6 +557,50 @@ def worker(directory):
     finish(job, directory, report, state, stage, summary)
 
 
+def prepare_attempt(job, directory, candidate, previous_directory):
+    if previous_directory is None:
+        chain = directory
+        previous = None
+    else:
+        previous = read(previous_directory / "INPUT.json")
+        if ("continuation_directory" not in previous or Path(previous["directory"]) != previous_directory
+                or any(previous[key] != job[key] for key in ("runtime_root", "stream"))):
+            raise RuntimeError("Retry must refer to a managed attempt for the same Hub and Stream")
+        chain = Path(previous["continuation_directory"])
+
+    # Prepare the successor before asking Hub to retire anything. A rejected or
+    # unresolved original leaves its selectable attempt and directory intact.
+    script = Path(__file__).name
+    with TemporaryDirectory(prefix=".release-attempt-", dir=directory.parent) as temporary:
+        staged = Path(temporary) / "attempt"
+        staged.mkdir()
+        installer_path = staged / "install_release.py"
+        installer_path.write_bytes(git(candidate, "show", f"{job['commit']}:AgentHub/distribution/install_release.py"))
+        shutil.copyfile(__file__, staged / script)
+        installer = load_installer(installer_path)
+        _, _, kernel = installer.native_api()
+        python = installer.process_identity(kernel.GetCurrentProcess())["image"]
+        with continuation_lock(chain) if previous is not None else nullcontext():
+            if directory.exists():
+                raise FileExistsError(f"Attempt directory already exists: {directory}")
+            job.update(continuation_directory=str(chain), previous_release=current_release(Path(job["runtime_root"])))
+            save(staged / "INPUT.json", job)
+            if previous is not None:
+                if read(chain / "CONTINUATION.json") != selected_attempt(previous):
+                    raise RuntimeError("Retry must refer to the current release attempt")
+                report = optional_record(previous_directory / "REPORT.json")
+                if not report or report.get("operationId") != previous["operation_id"]:
+                    raise RuntimeError("The current release attempt has no original terminal report")
+                outcome = retire_notification(previous, previous_directory)
+                save(staged / "PREDECESSOR.json", {"operationId": previous["operation_id"], "notification": outcome})
+            else:
+                save(staged / "CONTINUATION.json", selected_attempt(job))
+            staged.rename(directory)
+            if previous is not None:
+                save(chain / "CONTINUATION.json", selected_attempt(job))
+    return installer, python, directory / script
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--worker":
         worker(Path(sys.argv[2]).resolve())
@@ -449,9 +611,11 @@ def main():
     for argument in ("candidate", "commit", "tools-sha256", "runtime-root", "directory",
                      "release-id", "artifact-version", "stream"):
         start.add_argument("--" + argument, required=True)
+    start.add_argument("--connection-file", required=True, help="Private Hub connection JSON with the caller capability")
     start.add_argument("--tools-root", default=str(Path(__file__).resolve().parents[1]),
                        help="Release Tools export, defaults to this script's package")
     start.add_argument("--selection", required=True, type=json.loads, help="Existing test-suite selection JSON")
+    start.add_argument("--retry-of", type=Path, help="Directory of the current attempt in this release")
     sub.add_parser("resume-delivery", help="Retry just the existing notification").add_argument("directory", type=Path)
     args = parser.parse_args()
     directory = Path(args.directory).resolve()
@@ -462,25 +626,18 @@ def main():
         parser.error("Provide the target Hub Stream ID")
 
     job = vars(args).copy()
-    for key in ("candidate", "runtime_root", "tools_root"):
+    previous = job.pop("retry_of")
+    for key in ("candidate", "runtime_root", "tools_root", "connection_file"):
         job[key] = str(Path(job[key]).resolve(strict=True))
     candidate, root = Path(job["candidate"]), Path(job["runtime_root"])
     if directory.is_relative_to(root) or directory.is_relative_to(candidate):
         parser.error("Choose a working directory outside the candidate and installed Hub")
     assert_candidate(candidate, job["commit"])
-    job.update(directory=str(directory), operation_id="install-" + uuid.uuid4().hex,
-               previous_release=current_release(root), node=shutil.which("node"))
+    continuation_token(job)
+    job.update(directory=str(directory), operation_id="install-" + uuid.uuid4().hex, node=shutil.which("node"))
     if not job["node"]:
         raise RuntimeError("Node.js is not available")
-    directory.mkdir()
-    installer_path = directory / "install_release.py"
-    installer_path.write_bytes(git(candidate, "show", f"{job['commit']}:AgentHub/distribution/install_release.py"))
-    script = directory / Path(__file__).name
-    shutil.copyfile(__file__, script)
-    save(directory / "INPUT.json", job)
-    installer = load_installer(installer_path)
-    _, _, kernel = installer.native_api()
-    python = installer.process_identity(kernel.GetCurrentProcess())["image"]
+    installer, python, script = prepare_attempt(job, directory, candidate, previous.resolve(strict=True) if previous else None)
     try:
         dispatch = installer.independent_worker([python, "-X", "utf8", "-B", str(script), "--worker", str(directory)],
                                                directory, installer.clean_installer_environment())
