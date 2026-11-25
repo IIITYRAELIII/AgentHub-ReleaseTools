@@ -80,7 +80,11 @@ class ContinuationTest(unittest.TestCase):
                     self.admit(desktop)
                 self.assertEqual(actions, ["snapshot"])
                 self.assertEqual(release.read(self.state), release.selected_attempt(self.previous))
-                self.assertFalse(self.second.exists())
+                pending = release.read(self.second / "INPUT.json")
+                self.assertFalse((self.second / "PREDECESSOR.json").exists())
+                with self.assertRaisesRegex(RuntimeError, "Dispatch must address the current release attempt"):
+                    release.dispatch_attempt(pending, self.second, SimpleNamespace(WorkerDispatchError=DispatchError),
+                                             sys.executable, self.second / SCRIPT.name)
 
         def accepted(job, action, params, command_id=None):
             self.assertEqual(action, "snapshot")
@@ -139,15 +143,20 @@ class ContinuationTest(unittest.TestCase):
         self.assertTrue(release.read(self.second / "PREDECESSOR.json")["notification"]["cancelled"])
 
     def test_retry_reopens_the_same_successor_after_each_publication_cutpoint(self):
-        for cutpoint in ("predecessor-write", "directory-rename", "selection-replace"):
+        for cutpoint in ("predecessor-write", "directory-rename", "predecessor-slot", "selection-replace", None):
             with self.subTest(cutpoint=cutpoint):
-                self.verify_publication_cutpoint(cutpoint)
+                case = self.root / (cutpoint or "uninterrupted")
+                parent = case / ("x" * (153 - len(str(case)) - 1))
+                parent.mkdir(parents=True)
+                self.verify_publication_cutpoint(parent, cutpoint)
 
-    def verify_publication_cutpoint(self, cutpoint):
-        first = self.root / cutpoint
+    def verify_publication_cutpoint(self, parent, cutpoint):
+        first = parent / "first"
         first.mkdir()
+        second = parent / "second"
+        self.assertEqual((len(str(parent)), len(str(second))), (153, 160))
         old_first, old_second = self.first, self.second
-        self.first, self.second = first, self.root / (cutpoint + "-successor")
+        self.first, self.second = first, second
         old = self.job("first", first)
         state = first / "CONTINUATION.json"
         release.save(first / "INPUT.json", old)
@@ -170,17 +179,26 @@ class ContinuationTest(unittest.TestCase):
             retained = release.read(first / "CONTINUATION-RETRY.json")
             self.assertEqual(retained["job"]["operation_id"], "second")
             self.assertEqual(retained["previous"], release.selected_attempt(old))
+            self.assertEqual(release.read(self.second / "INPUT.json"), retained["job"])
+            for folder in (first, self.second):
+                self.assertEqual(len(list(folder.glob(".*.tmp"))), 1)
             cancellations.append(command_id)
             canonical = {**canonical, "queued": False, "cancelled": True, "commandState": "cancelled"}
             return canonical
 
-        rename, replace = Path.rename, Path.replace
+        rename, replace, touch = Path.rename, Path.replace, Path.touch
 
         def fail_rename(source, target):
             if cutpoint == "directory-rename" and target == self.second:
-                self.assertTrue(canonical["cancelled"])
+                self.assertTrue(canonical["queued"])
                 raise PermissionError(cutpoint)
             return rename(source, target)
+
+        def fail_touch(source, *args, **kwargs):
+            if cutpoint == "predecessor-slot" and source.parent == self.second:
+                self.assertTrue(canonical["queued"])
+                raise PermissionError(cutpoint)
+            return touch(source, *args, **kwargs)
 
         def fail_replace(source, target):
             if ((cutpoint == "selection-replace" and target == state)
@@ -195,19 +213,24 @@ class ContinuationTest(unittest.TestCase):
             return {"pid": 17}
 
         try:
-            with patch.object(Path, "rename", fail_rename), patch.object(Path, "replace", fail_replace):
-                with self.assertRaisesRegex(PermissionError, cutpoint):
-                    self.admit(desktop)
-            self.assertTrue(canonical["cancelled"])
-            self.assertEqual(release.read(state), release.selected_attempt(old))
-            self.assertEqual(self.second.exists(), cutpoint == "selection-replace")
-            self.assertEqual(launched, [])
+            after_cancel = cutpoint in ("predecessor-write", "selection-replace")
+            if cutpoint:
+                with (patch.object(Path, "rename", fail_rename), patch.object(Path, "replace", fail_replace),
+                      patch.object(Path, "touch", fail_touch)):
+                    with self.assertRaisesRegex(PermissionError, cutpoint):
+                        self.admit(desktop)
+                self.assertEqual(canonical.get("cancelled", False), after_cancel)
+                self.assertEqual(release.read(state), release.selected_attempt(old))
+                self.assertEqual(self.second.exists(), cutpoint != "directory-rename")
+                self.assertEqual(launched, [])
+                self.assertEqual(list(first.glob(".*.tmp")) + list(self.second.glob(".*.tmp")), [])
 
-            job, ports = self.admit(desktop, operation="new-cli-id", dispatch=launch)
+            operation = "new-cli-id" if cutpoint else "second"
+            job, ports = self.admit(desktop, operation=operation, dispatch=launch)
             self.assertEqual(job["operation_id"], "second")
             self.assertEqual(release.read(state), release.selected_attempt(job))
             self.assertEqual(release.read(self.second / "PREDECESSOR.json")["notification"], canonical)
-            self.assertEqual(readbacks, [["mcp:first:continue"]] * 2)
+            self.assertEqual(readbacks, [["mcp:first:continue"]] * (2 if after_cancel else 1))
             self.assertEqual(cancellations, ["mcp:first:continue:cancel"])
             self.assertEqual(release.dispatch_attempt(job, self.second, *ports), {"pid": 17})
             duplicate, ports = self.admit(desktop, operation="another-cli-id", dispatch=launch)

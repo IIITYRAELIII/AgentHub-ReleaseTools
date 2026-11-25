@@ -46,14 +46,28 @@ def read(path):
     return json.loads(path.read_bytes())
 
 
-def save(path, value):
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    with temporary.open("x", encoding="utf-8") as stream:
+@contextmanager
+def record_slot(path):
+    temporary = path.with_name(f".{uuid.uuid4().hex}.tmp")
+    temporary.touch(exist_ok=False)
+    try:
+        yield temporary
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def publish_record(temporary, path, value):
+    with temporary.open("w", encoding="utf-8") as stream:
         json.dump(value, stream, ensure_ascii=False, indent=2)
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(path)
+
+
+def save(path, value):
+    with record_slot(path) as temporary:
+        publish_record(temporary, path, value)
 
 
 def digest(path):
@@ -617,26 +631,25 @@ def retry_attempt(job, directory, previous, previous_directory, chain, installer
         job.update(continuation_directory=str(chain), previous_release=current_release(Path(job["runtime_root"])))
         save(retry_path, {"previous": original, "job": job, "runnerSha256": runner_sha, "installerSha256": installer_sha})
 
-    stage_name = ".release-retry-" + hashlib.sha256(job["operation_id"].encode()).hexdigest()
-    staged = directory.with_name(stage_name)
     launcher = None
-    if not directory.exists() and not staged.exists() and current == original:
-        launcher = stage_attempt(job, staged, installer_bytes)
-    prepared = directory if directory.exists() else staged
-    if (read(prepared / "INPUT.json") != job
-            or digest(prepared / Path(__file__).name) != runner_sha
-            or digest(prepared / "install_release.py") != installer_sha):
+    if current == original and not directory.exists():
+        launcher = stage_attempt(job, directory, installer_bytes)
+    if (read(directory / "INPUT.json") != job
+            or digest(directory / Path(__file__).name) != runner_sha
+            or digest(directory / "install_release.py") != installer_sha):
         raise RuntimeError("Retained successor files changed")
-    installer, python = launcher or attempt_launcher(prepared)
+    installer, python = launcher or attempt_launcher(directory)
 
     if current == original:
-        # Re-observe the same original on every recovery. A durable cancel is
-        # returned by snapshot; an earlier absence alone cannot prove no send.
-        outcome = retire_notification(previous, previous_directory)
-        save(prepared / "PREDECESSOR.json", {"operationId": previous["operation_id"], "notification": outcome})
-        if prepared == staged:
-            staged.rename(directory)
-        save(selection_path, selected_attempt(job))
+        predecessor_path = directory / "PREDECESSOR.json"
+        # Prepare both atomic write paths before touching the original notification.
+        # On recovery, the same original receipt still determines the outcome.
+        with record_slot(predecessor_path) as predecessor_slot, record_slot(selection_path) as selection_slot:
+            outcome = retire_notification(previous, previous_directory)
+            publish_record(predecessor_slot, predecessor_path, {
+                "operationId": previous["operation_id"], "notification": outcome,
+            })
+            publish_record(selection_slot, selection_path, selected_attempt(job))
     return installer, python, directory / Path(__file__).name
 
 
