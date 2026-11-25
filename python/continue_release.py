@@ -1,7 +1,7 @@
 """Build and install one reviewed candidate, then queue its result in Hub."""
 
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import errno
 import hashlib
 import importlib.util
@@ -505,18 +505,26 @@ def verified_result(job, receipt, pins):
     return state, summary
 
 
-def finish(job, directory, report, state, stage, summary):
+def save_report(job, directory, report, state, stage, summary):
     report_path = directory / "REPORT.json"
     report.update(operationId=job["operation_id"], source=job["commit"], streamId=job["stream"],
                   status=state, stage=stage,
                   message=f"Продолжай выпуск. {summary}\n[REPORT.json](<{report_path.as_posix()}>)\n"
                           "Перечитай актуальные правила релизного процесса перед продолжением.")
     save(report_path, report)
+
+
+def publish_report(job, directory, report):
     try:
         deliver(job, directory, report)
     except (KeyError, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         save(directory / "QUEUE-ERROR.json", {"operationId": job["operation_id"], "error": str(error)})
         raise
+
+
+def finish(job, directory, report, state, stage, summary):
+    save_report(job, directory, report, state, stage, summary)
+    publish_report(job, directory, report)
 
 
 def worker(directory):
@@ -557,48 +565,131 @@ def worker(directory):
     finish(job, directory, report, state, stage, summary)
 
 
-def prepare_attempt(job, directory, candidate, previous_directory):
-    if previous_directory is None:
-        chain = directory
-        previous = None
-    else:
-        previous = read(previous_directory / "INPUT.json")
-        if ("continuation_directory" not in previous or Path(previous["directory"]) != previous_directory
-                or any(previous[key] != job[key] for key in ("runtime_root", "stream"))):
-            raise RuntimeError("Retry must refer to a managed attempt for the same Hub and Stream")
-        chain = Path(previous["continuation_directory"])
+def attempt_launcher(directory):
+    installer = load_installer(directory / "install_release.py")
+    _, _, kernel = installer.native_api()
+    return installer, installer.process_identity(kernel.GetCurrentProcess())["image"]
 
-    # Prepare the successor before asking Hub to retire anything. A rejected or
-    # unresolved original leaves its selectable attempt and directory intact.
-    script = Path(__file__).name
-    with TemporaryDirectory(prefix=".release-attempt-", dir=directory.parent) as temporary:
+
+def stage_attempt(job, target, installer_bytes):
+    with TemporaryDirectory(prefix=".release-attempt-", dir=target.parent) as temporary:
         staged = Path(temporary) / "attempt"
         staged.mkdir()
-        installer_path = staged / "install_release.py"
-        installer_path.write_bytes(git(candidate, "show", f"{job['commit']}:AgentHub/distribution/install_release.py"))
-        shutil.copyfile(__file__, staged / script)
-        installer = load_installer(installer_path)
-        _, _, kernel = installer.native_api()
-        python = installer.process_identity(kernel.GetCurrentProcess())["image"]
-        with continuation_lock(chain) if previous is not None else nullcontext():
-            if directory.exists():
-                raise FileExistsError(f"Attempt directory already exists: {directory}")
-            job.update(continuation_directory=str(chain), previous_release=current_release(Path(job["runtime_root"])))
-            save(staged / "INPUT.json", job)
-            if previous is not None:
-                if read(chain / "CONTINUATION.json") != selected_attempt(previous):
-                    raise RuntimeError("Retry must refer to the current release attempt")
-                report = optional_record(previous_directory / "REPORT.json")
-                if not report or report.get("operationId") != previous["operation_id"]:
-                    raise RuntimeError("The current release attempt has no original terminal report")
-                outcome = retire_notification(previous, previous_directory)
-                save(staged / "PREDECESSOR.json", {"operationId": previous["operation_id"], "notification": outcome})
-            else:
-                save(staged / "CONTINUATION.json", selected_attempt(job))
+        (staged / "install_release.py").write_bytes(installer_bytes)
+        shutil.copyfile(__file__, staged / Path(__file__).name)
+        save(staged / "INPUT.json", job)
+        if job["continuation_directory"] == str(target):
+            save(staged / "CONTINUATION.json", selected_attempt(job))
+        launcher = attempt_launcher(staged)
+        staged.rename(target)
+    return launcher
+
+
+def retry_attempt(job, directory, previous, previous_directory, chain, installer_bytes):
+    selection_path = chain / "CONTINUATION.json"
+    retry_path = chain / "CONTINUATION-RETRY.json"
+    current = read(selection_path)
+    original = selected_attempt(previous)
+    try:
+        retained = read(retry_path)
+    except FileNotFoundError:
+        retained = None
+
+    runner_sha = digest(Path(__file__))
+    installer_sha = hashlib.sha256(installer_bytes).hexdigest()
+    if retained and retained["previous"] == original:
+        pinned = retained["job"]
+        if (pinned["directory"] != str(directory)
+                or any(pinned[key] != value for key, value in job.items() if key != "operation_id")
+                or retained["runnerSha256"] != runner_sha or retained["installerSha256"] != installer_sha):
+            raise RuntimeError("Retry must resume the exact retained successor")
+        if current not in (original, selected_attempt(pinned)):
+            raise RuntimeError("Retry must refer to the current release attempt")
+        job.update(pinned)
+    else:
+        if current != original or (retained and current != selected_attempt(retained["job"])):
+            raise RuntimeError("Retry must refer to the current release attempt")
+        if directory.exists():
+            raise FileExistsError(f"Attempt directory already exists: {directory}")
+        report = optional_record(previous_directory / "REPORT.json")
+        if not report or report.get("operationId") != previous["operation_id"]:
+            raise RuntimeError("The current release attempt has no original terminal report")
+        job.update(continuation_directory=str(chain), previous_release=current_release(Path(job["runtime_root"])))
+        save(retry_path, {"previous": original, "job": job, "runnerSha256": runner_sha, "installerSha256": installer_sha})
+
+    stage_name = ".release-retry-" + hashlib.sha256(job["operation_id"].encode()).hexdigest()
+    staged = directory.with_name(stage_name)
+    launcher = None
+    if not directory.exists() and not staged.exists() and current == original:
+        launcher = stage_attempt(job, staged, installer_bytes)
+    prepared = directory if directory.exists() else staged
+    if (read(prepared / "INPUT.json") != job
+            or digest(prepared / Path(__file__).name) != runner_sha
+            or digest(prepared / "install_release.py") != installer_sha):
+        raise RuntimeError("Retained successor files changed")
+    installer, python = launcher or attempt_launcher(prepared)
+
+    if current == original:
+        # Re-observe the same original on every recovery. A durable cancel is
+        # returned by snapshot; an earlier absence alone cannot prove no send.
+        outcome = retire_notification(previous, previous_directory)
+        save(prepared / "PREDECESSOR.json", {"operationId": previous["operation_id"], "notification": outcome})
+        if prepared == staged:
             staged.rename(directory)
-            if previous is not None:
-                save(chain / "CONTINUATION.json", selected_attempt(job))
-    return installer, python, directory / script
+        save(selection_path, selected_attempt(job))
+    return installer, python, directory / Path(__file__).name
+
+
+def prepare_attempt(job, directory, candidate, previous_directory):
+    installer_bytes = git(candidate, "show", f"{job['commit']}:AgentHub/distribution/install_release.py")
+    if previous_directory is None:
+        if directory.exists():
+            raise FileExistsError(f"Attempt directory already exists: {directory}")
+        job.update(continuation_directory=str(directory), previous_release=current_release(Path(job["runtime_root"])))
+        installer, python = stage_attempt(job, directory, installer_bytes)
+        return installer, python, directory / Path(__file__).name
+
+    previous = read(previous_directory / "INPUT.json")
+    if ("continuation_directory" not in previous or Path(previous["directory"]) != previous_directory
+            or any(previous[key] != job[key] for key in ("runtime_root", "stream"))):
+        raise RuntimeError("Retry must refer to a managed attempt for the same Hub and Stream")
+    chain = Path(previous["continuation_directory"])
+    with continuation_lock(chain):
+        return retry_attempt(job, directory, previous, previous_directory, chain, installer_bytes)
+
+
+def dispatch_attempt(job, directory, installer, python, script):
+    chain = Path(job["continuation_directory"])
+    receipt_path = directory / "DISPATCH.json"
+    report_path = directory / "REPORT.json"
+    try:
+        with continuation_lock(chain):
+            if receipt_path.exists():
+                return read(receipt_path)
+            if report_path.exists():
+                return None
+            if read(chain / "CONTINUATION.json") != selected_attempt(job):
+                raise RuntimeError("Dispatch must address the current release attempt")
+            # The existing native owner writes intent before calling WMI. A
+            # missing reply after that cutpoint is not safe to launch again.
+            if (directory / "worker-create-intent.json").exists():
+                raise RuntimeError(f"Worker dispatch is unconfirmed for {job['operation_id']}")
+            try:
+                dispatch = installer.independent_worker(
+                    [python, "-X", "utf8", "-B", str(script), "--worker", str(directory)],
+                    directory, installer.clean_installer_environment(),
+                )
+            except installer.WorkerDispatchError as error:
+                if error.checks.get("resumeAttempted") is False:
+                    save_report(job, directory, {"error": str(error), "dispatchChecks": error.checks},
+                                "failed", "worker-dispatch", f"Этап worker-dispatch: {error}.")
+                raise
+            save(receipt_path, dispatch)
+            return dispatch
+    except installer.WorkerDispatchError:
+        if report_path.exists():
+            publish_report(job, directory, read(report_path))
+        raise
 
 
 def main():
@@ -638,15 +729,7 @@ def main():
     if not job["node"]:
         raise RuntimeError("Node.js is not available")
     installer, python, script = prepare_attempt(job, directory, candidate, previous.resolve(strict=True) if previous else None)
-    try:
-        dispatch = installer.independent_worker([python, "-X", "utf8", "-B", str(script), "--worker", str(directory)],
-                                               directory, installer.clean_installer_environment())
-    except installer.WorkerDispatchError as error:
-        if error.checks.get("resumeAttempted") is False:
-            finish(job, directory, {"error": str(error), "dispatchChecks": error.checks}, "failed", "worker-dispatch",
-                   f"Этап worker-dispatch: {error}.")
-        raise
-    save(directory / "DISPATCH.json", dispatch)
+    dispatch = dispatch_attempt(job, directory, installer, python, script)
     print(json.dumps(dict(operationId=job["operation_id"], worker=dispatch, report=str(directory / "REPORT.json"))))
 
 

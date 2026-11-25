@@ -332,15 +332,17 @@ test("external release worker resumes from owner receipts and rejects tool drift
       };
       start(oldRelease);
       const initial = await waitReady();
+      let launchArgs;
       const launch = async (candidate, tools, directory, outcome, retryOf = []) => {
         const commit = await stageCandidate(candidate, tools, outcome, manifested, staged, directory);
         const tool = JSON.parse((await exec(process.execPath, [path.join(tools, "bin/release.mjs"), "identity"])).stdout);
-        const { stdout } = await exec(PYTHON, ["-X", "utf8", "-B", SCRIPT, "start", "--directory", directory,
+        launchArgs = ["-X", "utf8", "-B", SCRIPT, "start", "--directory", directory,
           "--candidate", candidate, "--commit", commit, "--tools-root", tools, "--tools-sha256", tool.sha256,
           "--runtime-root", runtimeRoot, "--release-id", candidateRelease, "--artifact-version", version + "+build.1",
           "--stream", stream, "--connection-file", connection,
           "--selection", JSON.stringify({ mode: "include", ids: ["fixture:chosen"] }),
-          ...retryOf], { timeout: 30_000, windowsHide: true });
+          ...retryOf];
+        const { stdout } = await exec(PYTHON, launchArgs, { timeout: 30_000, windowsHide: true });
         const receipt = JSON.parse(stdout);
         workerPid = receipt.worker.pid;
         return receipt;
@@ -408,7 +410,16 @@ test("external release worker resumes from owner receipts and rejects tool drift
         assert.equal(previous.steered, !retryQueued);
         assert.equal(old.notification.cancelled, retryQueued);
         assert.deepEqual(await readFile(failed.report), failed.reportBytes);
-        if (retryQueued) await seedIdleRollout();
+        if (retryQueued) {
+          const dispatchFile = path.join(directory, "DISPATCH.json");
+          const retainedDispatch = await readFile(dispatchFile);
+          for (const replay of await Promise.all([1, 2].map(() =>
+            exec(PYTHON, launchArgs, { timeout: 30_000, windowsHide: true })))) {
+            assert.deepEqual(JSON.parse(replay.stdout), dispatch);
+          }
+          assert.deepEqual(await readFile(dispatchFile), retainedDispatch);
+          await seedIdleRollout();
+        }
         else await closeFixtureTurn();
       }
       const scratch = path.join(directory, "installer-scratch");
