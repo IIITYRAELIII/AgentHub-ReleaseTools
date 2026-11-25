@@ -16,6 +16,9 @@
     "python/build_release.py",
     "python/build_package.py",
     "python/archive_contract.py",
+    "python/continue_release.py",
+    "recipient/install-prepared.mjs",
+    "recipient/config.example.json",
     "README.md"
   ],
   "repositoryFiles": [
@@ -33,10 +36,14 @@
     "python/build_release.py",
     "python/build_package.py",
     "python/archive_contract.py",
+    "python/continue_release.py",
+    "recipient/install-prepared.mjs",
+    "recipient/config.example.json",
     "README.md",
     ".gitignore",
     "tests/hub-client.test.mjs",
     "tests/test_build_release.py",
-    "tests/build.test.mjs"
+    "tests/build.test.mjs",
+    "tests/external-release-continuation.test.mjs"
   ]
 }
